@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+out/
+data/
+*.ndjson
+transcripts*.tar.gz
+.env
+wallet*.json
