@@ -7,6 +7,11 @@ import json
 import os
 import sys
 
+# the model sits beside this file: import it however the program is launched (python3 /bot/main.py, -I, runpy)
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
 INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
 OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
 
@@ -89,7 +94,7 @@ def main():
     snaps.sort(key=lambda s: str(s.get("at", "")) if isinstance(s, dict) else "")
     doc = build_forecast(snaps, task)
     out = os.path.join(OUTPUT_DIR, task.get("output") or "forecast.json")
-    with open(out, "w", encoding="utf-8") as f:
+    with open(out, "w", encoding="utf-8", newline="\n") as f:
         f.write(json.dumps(doc, separators=(",", ":")) + "\n")
     return 0
 

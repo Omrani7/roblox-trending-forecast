@@ -18,21 +18,28 @@ from datetime import datetime, timezone
 DEFAULT_PARAMS = {
     "sims": 3000,
     "seed": 20261110,
-    "sigma_top": 0.10,      # sd of log-rank per hour**alpha at rank 1
-    "sigma_low": 0.07,      # ... at rank >= 20
+    "sigma_top": 0.06,      # sd of log-rank per hour**alpha at rank 1
+    "sigma_low": 0.055,      # ... at rank >= 20
     "alpha": 0.5,
-    "c_mom": 0.25,          # weight of the 24h log-rank trend on the 24h drift
-    "c_grow": 0.35,         # weight of the 24h log player growth on the 24h drift (minus: growth lifts the game)
+    "c_mom": 0.0,          # weight of the 24h log-rank trend on the 24h drift
+    "c_grow": 0.75,         # weight of the 24h log player growth on the 24h drift (minus: growth lifts the game)
     "rel_growth": 1,        # growth taken relative to the chart's median growth
+    "grow_lags": 1,         # 1: 24h growth; 2: mean of 24h and 48h growth (per 24h)
     "c_mom_s": 0.0,         # weight of the 6h log-rank trend (scaled to 6h) on the 24h drift
     "drift_cap": 1.0,       # max |drift| over 24h in log-rank
+    "game_vol_w": 1.0,      # exponent on a game's own recent jumpiness scaling its sigma; 0 = off
     "vol_w": 0.0,           # exponent on (recent volatility / vol_ref) scaling sigma; 0 = off
     "vol_ref": 0.049,       # the archive's volatility statistic (recent_vol over 2026-10-30..11-08)
-    "exit_rate": 0.004,     # per hour per game
+    "exit_rate": 0.002,     # per hour per game
+    "exit_top": 0.002,      # per hour, for the games at places 1-3
+    "jump_rate": 0.0,       # rockets per hour, per 0.25 of 6h log-rank rise beyond jump_thresh (capped at 3x)
+    "jump_thresh": 0.15,    # 6h log-rank rise below which a game does not rocket
+    "jump_from": 10,        # only games below this place rocket
+    "jump_land": 15,        # a rocket lands uniformly in log-rank between place 1.5 and this place
     "entry_rate": 0.03,     # unseen games reaching the top 12 per hour
-    "smooth": 0.06,         # mass mixed in from the broad prior
+    "smooth": 0.04,         # mass mixed in from the broad prior
     "prior_width": 0.9,     # sd in log-rank of the broad prior kernel
-    "unnamed": 0.02,        # mass of each place left unnamed (for unseen games)
+    "unnamed": 0.001,        # mass of each place left unnamed (for unseen games)
 }
 
 LAG_H = 24.0
@@ -118,14 +125,27 @@ def lagged(reads, uid_list, y_now, lag, tol):
     return out
 
 
-def features(reads, lag=LAG_H, tol=6.0, rel_growth=True, short_lag=6.0):
+def features(reads, lag=LAG_H, tol=6.0, rel_growth=True, short_lag=6.0, grow_lags=1):
     """Per game on the last chart: (log rank now, 24h log-rank trend, 24h log player growth, short log-rank trend).
 
     Growth is relative to the chart's median growth when rel_growth: the chart ranks games against each other, and a
-    weekday or seasonal swing that lifts every game's players moves no game's place."""
+    weekday or seasonal swing that lifts every game's players moves no game's place. With grow_lags 2 the growth is
+    the mean of the 24h growth and half the 48h growth (both same time of day, so less diurnal noise)."""
     t, ids, playing = reads[-1]
     y_now = {u: math.log(i + 1) for i, u in enumerate(ids)}
     long = lagged(reads, ids, y_now, lag, tol)
+    if grow_lags >= 2 and long is not None:
+        l2 = lagged(reads, ids, y_now, 2 * lag, tol)
+        if l2 is not None:
+            mixed = {}
+            for u, (mom, g) in long.items():
+                g2 = l2[u][1]
+                if g is None:
+                    g = None if g2 is None else g2 / 2
+                elif g2 is not None:
+                    g = 0.5 * (g + g2 / 2)
+                mixed[u] = (mom, g)
+            long = mixed
     short = lagged(reads, ids, y_now, short_lag, short_lag / 2)
     med = 0.0
     if long is not None and rel_growth:
@@ -173,6 +193,34 @@ def recent_vol(reads, alpha, span=72.0, target=6.0, max_rank=30):
     return (tot / n if n else None), n
 
 
+def game_vol(reads, alpha, span=48.0, max_rank=40):
+    """Per game: mean |change in log rank| / h**alpha over consecutive-ish read pairs (>= 3 h apart) in the last
+    `span` hours, and the same over all games, for scaling each game's sigma by its own recent jumpiness."""
+    t_end = reads[-1][0]
+    rs = [r for r in reads if r[0] >= t_end - span]
+    per, allsum, alln = {}, 0.0, 0
+    i = 0
+    while i < len(rs) - 1:
+        j = i + 1
+        while j < len(rs) - 1 and rs[j][0] - rs[i][0] < 3:
+            j += 1
+        if rs[j][0] - rs[i][0] < 3:
+            break
+        hp = (rs[j][0] - rs[i][0]) ** alpha
+        posb = {u: k for k, u in enumerate(rs[j][1])}
+        for k, u in enumerate(rs[i][1][:max_rank]):
+            if u in posb:
+                d = abs(math.log(posb[u] + 1) - math.log(k + 1)) / hp
+                s = per.setdefault(u, [0.0, 0])
+                s[0] += d
+                s[1] += 1
+                allsum += d
+                alln += 1
+        i = j
+    mean = allsum / alln if alln else None
+    return {u: v[0] / v[1] for u, v in per.items()}, mean, {u: v[1] for u, v in per.items()}
+
+
 def window_hours(task, t_last):
     """Hours from the last read to each scored slot (the slot's start: the recorder reads on the hour)."""
     w = task.get("window") or {}
@@ -197,7 +245,7 @@ def simulate(reads, task, params):
     p.update(params or {})
     places = int(task.get("places") or 10)
     t_last, ids, _ = reads[-1]
-    feats = features(reads, rel_growth=bool(p["rel_growth"]))
+    feats = features(reads, rel_growth=bool(p["rel_growth"]), grow_lags=int(p["grow_lags"]))
     hours = window_hours(task, t_last)
     H = len(hours)
     rng = random.Random(p["seed"])
@@ -215,6 +263,15 @@ def simulate(reads, task, params):
         if v is not None and npairs >= 50:
             vol_mult = max(0.5, min(2.0, (v / p["vol_ref"]) ** p["vol_w"]))
     sig = [sigma_of(i + 1, p) * vol_mult for i in range(n)]
+    if p["game_vol_w"] > 0:
+        gv, gmean, gn = game_vol(reads, p["alpha"])
+        if gmean:
+            for i, u in enumerate(ids):
+                if u in gv:
+                    # shrink the game's own ratio toward 1 by how many pairs it rests on
+                    w = gn[u] / (gn[u] + 3.0)
+                    ratio = (gv[u] + 0.3 * gmean) / (1.3 * gmean)
+                    sig[i] *= max(0.6, min(1.8, ratio ** (p["game_vol_w"] * w)))
     hpow = [h ** p["alpha"] for h in hours]
     hmax = hours[-1]
     counts = [dict() for _ in range(places)]
@@ -223,10 +280,22 @@ def simulate(reads, task, params):
     exit_rate, entry_rate = p["exit_rate"], p["entry_rate"]
     log12 = math.log(12)
     sims = int(p["sims"])
+    # per-game exit hazard (the top 3 have their own) and rocket hazard (a game far down the chart reaching
+    # the top places within hours, as Ragdoll Physics did from #42 to #5); a game already rising fast rockets more often
+    ex_rate = [p["exit_top"] if i < 3 else exit_rate for i in range(n)]
+    jr = []
+    for i, u in enumerate(ids):
+        # the 6h log-rank rise beyond a threshold: games that are already shooting up the chart
+        rising = max(0.0, -feats[u][3] - p["jump_thresh"]) / 0.25
+        jr.append(p["jump_rate"] * min(3.0, rising) if i >= p["jump_from"] else 0.0)
+    jlo, jhi = math.log(1.5), math.log(p["jump_land"])
     for _ in range(sims):
         z = [gauss(0.0, 1.0) for _ in range(n)]
         # exit time per game (hours from the last read); inf when it stays the whole window
-        ex = [expo(exit_rate) if exit_rate > 0 else math.inf for _ in range(n)]
+        ex = [expo(r) if r > 0 else math.inf for r in ex_rate]
+        # jump time and size per game; a jump lowers the latent log-rank by the size from then on
+        jt = [expo(r) if r > 0 else math.inf for r in jr]
+        jy = [rng.uniform(jlo, jhi) if t < hmax else 0.0 for t in jt]
         # entrants: (arrival hour, latent y)
         ent = []
         if entry_rate > 0:
@@ -237,7 +306,8 @@ def simulate(reads, task, params):
         for hi in range(H):
             h = hours[hi]
             hp = hpow[hi]
-            ys = [(y0[i] + drift[i] * h + sig[i] * hp * z[i], i) for i in range(n) if ex[i] > h]
+            ys = [(y0[i] + drift[i] * h + sig[i] * hp * z[i] if jt[i] > h else jy[i], i)
+                  for i in range(n) if ex[i] > h]
             for (ta, ye) in ent:
                 if ta <= h:
                     ys.append((ye, -1))

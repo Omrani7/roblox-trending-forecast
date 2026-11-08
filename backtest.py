@@ -131,6 +131,7 @@ def main(argv=None):
     ap.add_argument("--step", type=float, default=0.0)
     ap.add_argument("--late-from", type=float, default=0.0)
     ap.add_argument("--set", action="append")
+    ap.add_argument("--exclude", default=None, help="FROM,UNTIL: drop cutoffs whose window overlaps it")
     ap.add_argument("-v", action="store_true")
     a = ap.parse_args(argv)
     raw = [json.loads(l) for l in open(a.history, encoding="utf-8") if l.strip()]
@@ -138,6 +139,9 @@ def main(argv=None):
     reads = fm.clean_snapshots(raw)
     start = fm.parse_time(a.start) if a.start else -1e18
     cuts = cutoffs_of(reads, a.gap, start, a.min_hist, a.step)
+    if a.exclude:
+        lo, hi = (fm.parse_time(x) for x in a.exclude.split(","))
+        cuts = [c for c in cuts if c + 24 <= lo or c >= hi]
     t0 = time.time()
     res = run(raw, reads, model_fn(a.model, parse_sets(a.set)), cuts, a.late_from, a.v)
     s = summary(res)
