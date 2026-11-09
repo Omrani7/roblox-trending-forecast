@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 DEFAULT_PARAMS = {
     "sims": 3000,
     "seed": 20261110,
-    "sigma_top": 0.06,      # sd of log-rank per hour**alpha at rank 1
+    "sigma_top": 0.04,      # sd of log-rank per hour**alpha at rank 1 (retuned 2026-11-09 on dense hourly windows)
     "sigma_low": 0.055,      # ... at rank >= 20
     "alpha": 0.5,
     "c_mom": 0.0,          # weight of the 24h log-rank trend on the 24h drift
@@ -31,7 +31,9 @@ DEFAULT_PARAMS = {
     "vol_w": 0.0,           # exponent on (recent volatility / vol_ref) scaling sigma; 0 = off
     "vol_ref": 0.049,       # the archive's volatility statistic (recent_vol over 2026-10-30..11-08)
     "exit_rate": 0.002,     # per hour per game
-    "exit_top": 0.002,      # per hour, for the games at places 1-3
+    "exit_top": 0.004,      # per hour, for the games at places 1-3 (retuned 2026-11-09)
+    "exit_grow": 0.0,       # exit hazard multiplied by exp(exit_grow * relative 24h log player loss); 0 = off
+    "exit_cap": 20.0,       # ... at most this many times the base hazard
     "jump_rate": 0.0,       # rockets per hour, per 0.25 of 6h log-rank rise beyond jump_thresh (capped at 3x)
     "jump_thresh": 0.15,    # 6h log-rank rise below which a game does not rocket
     "jump_from": 10,        # only games below this place rocket
@@ -283,6 +285,12 @@ def simulate(reads, task, params):
     # per-game exit hazard (the top 3 have their own) and rocket hazard (a game far down the chart reaching
     # the top places within hours, as Ragdoll Physics did from #42 to #5); a game already rising fast rockets more often
     ex_rate = [p["exit_top"] if i < 3 else exit_rate for i in range(n)]
+    if p["exit_grow"] > 0:
+        # a game losing players against the chart leaves it sooner (Blox Fruits fell from #2 off the chart on
+        # 2026-11-09 after its players dropped 40% in a day); capped so one bad read cannot evict a game outright
+        for i, u in enumerate(ids):
+            loss = max(0.0, -feats[u][2])
+            ex_rate[i] *= min(p["exit_cap"], math.exp(p["exit_grow"] * loss))
     jr = []
     for i, u in enumerate(ids):
         # the 6h log-rank rise beyond a threshold: games that are already shooting up the chart
