@@ -34,13 +34,17 @@ DEFAULT_PARAMS = {
     "exit_top": 0.004,      # per hour, for the games at places 1-3 (retuned 2026-11-09)
     "exit_grow": 0.0,       # exit hazard multiplied by exp(exit_grow * relative 24h log player loss); 0 = off
     "exit_cap": 20.0,       # ... at most this many times the base hazard
+    "c_tenure": 0.06,       # 24h log-rank drift per day on the chart beyond tenure_ref (plus: older games slide)
+    "tenure_ref": 3.0,      # days on the chart at which tenure is neutral
+    "tenure_cap": 5.0,      # days beyond tenure_ref that still add (the history starts 2026-10-30, so older is unknown)
+    "exit_tenure": 0.2,     # exit hazard multiplied by exp(exit_tenure * days beyond tenure_ref, capped)
     "jump_rate": 0.0,       # rockets per hour, per 0.25 of 6h log-rank rise beyond jump_thresh (capped at 3x)
     "jump_thresh": 0.15,    # 6h log-rank rise below which a game does not rocket
     "jump_from": 10,        # only games below this place rocket
     "jump_land": 15,        # a rocket lands uniformly in log-rank between place 1.5 and this place
     "entry_rate": 0.03,     # unseen games reaching the top 12 per hour
     "smooth": 0.04,         # mass mixed in from the broad prior
-    "prior_width": 0.9,     # sd in log-rank of the broad prior kernel
+    "prior_width": 1.2,     # sd in log-rank of the broad prior kernel
     "unnamed": 0.001,        # mass of each place left unnamed (for unseen games)
 }
 
@@ -253,10 +257,18 @@ def simulate(reads, task, params):
     rng = random.Random(p["seed"])
     n = len(ids)
     y0 = [feats[u][0] for u in ids]
+    # tenure: days since the game first showed on the chart in this history. The chart ranks growth against a week
+    # earlier, so a game a week into its run is up against its own spike and slides; a new one is still climbing
+    seen_from = {}
+    for t_read, ids_read, _ in reads:
+        for u in ids_read:
+            seen_from.setdefault(u, t_read)
+    tenure = {u: (t_last - seen_from.get(u, t_last)) / 24.0 for u in ids}
     drift = []
     for u in ids:
         _, mom, grow, mom_s = feats[u]
         d = p["c_mom"] * mom - p["c_grow"] * grow + p["c_mom_s"] * mom_s
+        d += p["c_tenure"] * max(-p["tenure_ref"], min(p["tenure_cap"], tenure[u] - p["tenure_ref"]))
         d = max(-p["drift_cap"], min(p["drift_cap"], d))
         drift.append(d / 24.0)
     vol_mult = 1.0
@@ -291,6 +303,10 @@ def simulate(reads, task, params):
         for i, u in enumerate(ids):
             loss = max(0.0, -feats[u][2])
             ex_rate[i] *= min(p["exit_cap"], math.exp(p["exit_grow"] * loss))
+    if p["exit_tenure"] > 0:
+        for i, u in enumerate(ids):
+            over = max(0.0, min(p["tenure_cap"], tenure[u] - p["tenure_ref"]))
+            ex_rate[i] *= math.exp(p["exit_tenure"] * over)
     jr = []
     for i, u in enumerate(ids):
         # the 6h log-rank rise beyond a threshold: games that are already shooting up the chart
