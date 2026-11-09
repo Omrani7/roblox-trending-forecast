@@ -43,9 +43,10 @@ DEFAULT_PARAMS = {
     "jump_from": 10,        # only games below this place rocket
     "jump_land": 15,        # a rocket lands uniformly in log-rank between place 1.5 and this place
     "entry_rate": 0.03,     # unseen games reaching the top 12 per hour
-    "smooth": 0.04,         # mass mixed in from the broad prior
-    "prior_width": 1.2,     # sd in log-rank of the broad prior kernel
+    "smooth": 0.02,         # mass mixed in from the broad prior (retuned 2026-11-09 22:40Z with name_all on: 56 windows)
+    "prior_width": 0.5,     # sd in log-rank of the broad prior kernel
     "unnamed": 0.001,        # mass of each place left unnamed (for unseen games)
+    "name_all": 1,          # name every game of the last chart, so the unnamed share goes to newcomers alone
 }
 
 LAG_H = 24.0
@@ -345,11 +346,11 @@ def simulate(reads, task, params):
     return ids, [{ids[i]: c / total for i, c in ck.items()} for ck in counts], p
 
 
-def prior_row(k, ids, width):
+def prior_row(k, ids, width, depth=60):
     """A broad kernel around place k over the chart's games, in log-rank."""
     lk = math.log(k)
     w = {}
-    for i, u in enumerate(ids[:60]):
+    for i, u in enumerate(ids[:depth]):
         d = (math.log(i + 1) - lk) / width
         w[u] = math.exp(-0.5 * d * d)
     s = sum(w.values())
@@ -359,8 +360,15 @@ def prior_row(k, ids, width):
 def build_doc(ids, sim, p, places):
     rows = []
     smooth, unnamed = p["smooth"], p["unnamed"]
+    # name every game of the last chart (a game deep in it almost never reaches the top 10 within a day, and one
+    # left unnamed would take a slice of the unnamed share): what the place leaves unnamed then goes only to games
+    # new to the chart, the ones that take a place from nowhere (Forsaken went from off the chart to #1 on
+    # 2026-11-09), shared among a handful of newcomers instead of every deep game
+    name_all = p.get("name_all", 0) > 0
+    depth = 100 if name_all else 60
+    floor_p = 1e-6 if name_all else 0.0
     for k in range(1, places + 1):
-        prior = prior_row(k, ids, p["prior_width"])
+        prior = prior_row(k, ids, p["prior_width"], depth)
         mass = 1.0 - unnamed
         cand = set(sim[k - 1]) | set(prior)
         probs = {}
@@ -370,6 +378,8 @@ def build_doc(ids, sim, p, places):
         best = sorted(probs.items(), key=lambda kv: (-kv[1], kv[0]))[:100]
         for u, q in best:
             q = math.floor(q * 1e6) / 1e6
+            if floor_p > 0 and q < floor_p:
+                q = floor_p
             if q > 0:
                 rows.append({"universe_id": u, "place": k, "p": q})
     # point guess: by expected place over the window, then chart order
